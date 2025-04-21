@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<head>
+  <title>Design of Basic PTC implementation</title>
+</head>
+<body>
+  <h1 id="design-of-basic-ptc-implementation">Design of Basic PTC implementation</h1>
+  
+  <p>I will now describe a sketch for a simple possible implementation of a Positive Train Control (PTC) system. I will focus on the Locomotive Unit (LU), but other components will be briefly mentioned when relevant.</p>
+  
+  <h2 id="overview-of-the-system">Overview of the system</h2>
+
+  <p>The PTC system that we are designing is made of three components: a Locomotive Unit (LU), a Wayside Unit (WU) and a Central Server (CS).</p>
+  
+  <ul>
+    <li>
+      <p>The LU periodically sends its position and speed to the CS, while receiving information about its Movement Authority (MA) based on the state of the track circuits, following signal aspects, etc. The MA will determine how the locomotive will behave, including activation of emergency features if necessary.</p>
+    </li>
+    <li>
+      <p>The WU for each track section will periodically send its state to the CS, informing the system and dispatchers of the conditions of the track, such as circuit occupation, signal aspects, or faults.</p>
+    </li>
+    <li>
+      <p>The CS for a given territory processes the information received from both LUs and WUs, displaying relevant information for dispatchers and allowing them to safely control train movements. It interfaces with the interlocking logic for the territory to determine if the MA can be safely issued to a given train. It can automatically issue the MA if configured to do so, or it can simply assist the dispatchers.</p>
+    </li>
+  </ul>
+  
+  <h2 id="locomotive-unit-overview">Locomotive Unit overview</h2>
+  
+  <p>The LU has two main jobs:</p>
+  
+  <ul>
+    <li>Transmitting train position and speed</li>
+    <li>Ensuring the train does not violate its MA</li>
+  </ul>
+  
+  <p>As the second task is safety-critical, it has to accomplish it even in case of disruption to communication systems, including:</p>
+  <ol>
+    <li>Inability to receive MA for a period of time</li>
+    <li>Invalid MA received</li>
+    <li>Contradictory MA received</li>
+    <li>Invalid train position/speed</li>
+  </ol>
+  
+  <p>We will have to implement appropriate failsafes for all these scenarios.</p>
+  
+  <h3 id="safety-requirements">Safety requirements</h3>
+  
+  <p>We have two main safety requirements:</p>
+  
+  <ul>
+    <li>Stopping the train if a potentially unsafe situation occurs</li>
+    <li>Avoiding dangerous train operation, such as excessive braking or jerkiness, which can put strain on the mechanical, electrical and hydraulic components of the train. For passenger trains, it can also cause injuries.</li>
+  </ul>
+  
+  <p>In the following, we will design an implementation for the LU logic to satisfy these requirements.</p>
+  
+  <h2 id="system-implementation">System implementation</h2>
+  
+  <h3 id="architecture">Architecture</h3>
+  
+  <p>As we are dealing with safety-critical systems, we will use a Real-Time Operating System to implement the LU logic. Processing communications and applying adjustments to the train are both critical tasks that need to operate in predictable timeframes, to avoid critical data loss or unsafe train operation.</p>
+  
+  <p>For the safety-critical tasks, we will use static memory allocation to ensure fast access and no allocation overheads at runtime.</p>
+  
+  <h3 id="task-scheduling">Task scheduling</h3>
+  
+  <p>We will use a priority-based task scheduler, which will ensure that safety-critical operations have priority over less important tasks, such as calculating and broadcasting the train position. To avoid starvation, we can implement an aging system, which will eventually increase priority of less critical tasks, ensuring they are never fully skipped for too long.</p>
+  
+  <p>We have the following tasks, in decreasing order of priority:</p>
+  
+  <ul>
+    <li>Apply train controls if necessary
+      <ul>
+        <li>Cannot wait as train is moving and might violate MA</li>
+      </ul>
+    </li>
+    <li>Update target speed
+      <ul>
+      <li>Slightly lower priority as sudden changes in target speed are unlikely; ages to ensure target speed is up-to-date</li>
+    </ul>
+    </li>
+    <li>Receive MA from CS
+      <ul>
+        <li>Can wait, assuming the receiving hardware has an appropriate ringbuffer, but is still high-priority</li>
+      </ul>
+    </li>
+    <li>Communicate train position and speed
+      <ul>
+        <li>Lower than any of the safety critical tasks, but needs to happen frequently to give CS a clear picture of train status</li>
+      </ul>
+    </li>
+    <li>Calculate train speed</li>
+    <li>Receive train position from GPS
+      <ul>
+        <li>Both of these are necessary to communicate status to CS; they will age appropriately to avoid stale data communication</li>
+      </ul>
+    </li>
+  </ul>
+
+  <h3 id="train-control">Train control</h3>
+
+  <p>We will not go into details on the hardware that directly controls the train, but we will outline the control logic based on train status.</p>
+  
+  <p>Pseudocode for the logic:</p>
+  
+  <pre><code>function controlTrain(<span class="hljs-name">currentSpeed</span>, currentPos, targetSpeed, targetPos)
+    distance = calculateDistance(<span class="hljs-name">currentPos</span>, targetPos)
+    projectedSpeed = estimateSpeedFromNormalBrakingCurve(<span class="hljs-name">currentSpeed</span>, distance)
+    if projectedSpeed &gt; targetSpeed then
+      brakingForce = getBrakingForceFromCorrectionCurve(<span class="hljs-name">projectedSpeed</span>, targetSpeed, distance)
+    else
+      brakingForce = <span class="hljs-number">0</span>
+    return brakingForce
+  </code></pre>
+  
+  <p>At each time slice, the logic will use the target speed and position obtained from the MA to determine if the train is currently able to reach the target speed using a normal braking curve. If it is, no action is required and the logic can immediately yield.</p>
+  
+  <p>If the train is projected to be faster than the target speed at the target position, braking is immediately applied. The amount of braking is calculated using a different, steeper curve, which will return the train to a safe operational state.</p>
+  
+  <p>The parameters for these curves will depend on the safety margins to be obtained, and are highly dependent on the characteristics of the train and track: factors such as train weight, braking system power, slope of the track and weather have major effects on the braking distance. In a sophisticated system, these parameters can be provided by LUs and WUs to the CS, which can then inform the LUs on which calculation parameters to use.</p>
+  
+  <p>Alternatively, in a simpler system, the most conservatives estimates can be used in all cases (steep slope, ineffective brakes, harsh weather); this will however reduce train performance considerably, forcing train engineers to brake early even when unnecessary.</p>
+  
+  <p>To avoid computationally expensive formulas, braking curve data can be pre-calculated in stored tables, based on a number of profiles, with the CS sending information on which profile to use in any given situation. This is a compromise that can improve train performance while minimizing the amount of calculation to be performed on the LU.</p>
+  
+  <p>Safe operation of the train also requires avoiding sudden speed changes and jerkiness in general. Braking profiles will be calculated to take this factor into account, and control logic can be enhanced to smooth out the required changes; as an example, we could implement a &quot;cooldown&quot; period after braking before acceleration can be applied again, or define a G-force threshold to be calculated to clamp acceleration/braking commands.</p>
+  
+  <p>Alternatively, the train control system (rather than the PTC LU) can directly implement these features, similarly to how aircraft control systems enforce boundaries on sudden maneuvers (flight envelope protection), preventing damage to the aircraft or stall conditions. </p>
+  
+  <h3 id="movement-authority">Movement Authority</h3>
+  
+  <p>The LU periodically receives MA directives issued by Dispatchers from the CS, which include information on target speed and target distance, i.e. where the next target speed needs to reached. These can be due to occupied track, trackside workers, switches, faults and other situations.</p>
+  
+  <p>The packet will be formed as follows:</p>
+  
+  <ol>
+    <li>Sequence number, to identify packet losses or out-of-order reception</li>
+    <li>Train ID, allowing the LU to check that the directive is applicable to it</li>
+    <li>Target Speed</li>
+    <li>Target Position</li>
+    <li>Expiration. Past this time, absence of further MAs will be interpreted as an immediate order to stop</li>
+    <li>Checksum, to ensure integrity</li>
+  </ol>
+
+  <p>For further robustness, Error Correction Codes (ECC) can be applied to the various fields, increasing the rate of successfully parsed packets.</p>
+  
+  <p>Packets with invalid checksum will be rejected and treated as absence of MA, with the same effects: at the expiration of the current MA, an immediate stop will be performed, setting target speed to 0 and target position to the current train position.</p>
+  
+  <p>These packets will be received from the LU communication system, parsed and the information will be stored in statically allocated memory.</p>
+  
+  <p>If the new MA contradicts the current one, it will normally replace it if the sequence number is greater, with the assumption that the dispatcher has issued a more restrictive order for safety reasons; e.g. a train in front has derailed, or a track fault has been detected.</p>
+  
+  <h3 id="position-calculation">Position calculation</h3>
+  
+  <p>The LU needs to periodically send position and speed info to the CS, allowing dispatchers to have an up-to-date picture of train positions, required to issue MAs correctly.</p>
+  
+  <p>Data for train position will usually come from a GPS module, but due to the relatively large error of civilian GPS, it is not enough to identify the exact track on which the train is located. Additional precision can come from more advanced positioning systems, such as HA-GPS, or dedicated track equipment (beacons/balises) which directly communicates with on-train systems, either passively or actively.</p>
+  
+  <p>We will assume that a separate positioning module provides us with location information by integrating these multiple data sources into a best estimate of the current train position. Position data is sent by the external peripheral via the internal train bus and exposed as a memory-mapped register.</p>
+  
+  <p>If the position cannot be determined, for example because of GPS signal loss, the positioning module will return a special error code and no information will be sent; the same will happen if the value is clearly invalid (e.g., beyond a certain distance from the previous recorded location). This is to avoid providing incorrect data to the dispatchers which might mislead them into making incorrect assumptions about the train (for example, if we sent the last known location, it would convey that the train is stopped, which might not be the case. This would have severe consequences).</p>
+  
+  <p>On the CS side, if no position data is received for a certain time, an immediate stopping order will be issued, which ensures that a &quot;lost&quot; train cannot find itself in dangerous situations.</p>
+  
+  <h3 id="speed-calculation">Speed calculation</h3>
+  
+  <p>The LU will receive speed data directly from the Train Control System, which calculates it from wheel rotation and accurate time-tracking. Much like position data, train speed information is provided as a memory-mapped register that we can easily access at a static address. </p>
+  
+  <p>Similar considerations to position apply regarding missing/invalid data.</p>
+  
+  <h2 id="other-considerations">Other considerations</h2>
+  
+  <p>There are many other aspects that we have not touched on in this documents. Here is a non-exhaustive list:</p>
+  
+  <ul>
+    <li>More advanced train status information, such as weight, integrity (OTI), faults, etc.</li>
+    <li>Handling of transitions from/to non-PTC areas</li>
+    <li>Startup/shutdown</li>
+    <li>Cybersecurity - authentication of CS/LU to prevent malicious MA packets from being processed</li>
+    <li>Messaging QoS management - we assumed access to an appropriate low-level library to manage packet acknowledgement, handling of duplicates, delivery retry logic, etc.</li>
+    <li>Interoperation with other safety systems, such as Crew Alert</li>
+    <li>Hardware and Electrical issues</li>
+  </ul>
+</body>
